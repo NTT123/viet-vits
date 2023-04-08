@@ -1,13 +1,8 @@
-import argparse
-import itertools
-import json
-import math
 import os
 
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from torch import nn, optim
 from torch.cuda.amp import GradScaler, autocast
 from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -24,6 +19,7 @@ from text.symbols import symbols
 
 torch.backends.cudnn.benchmark = True
 global_step = 0
+NUM_DATA_WORKERS = 2
 
 
 def main():
@@ -32,7 +28,7 @@ def main():
 
     n_gpus = torch.cuda.device_count()
     os.environ["MASTER_ADDR"] = "localhost"
-    os.environ["MASTER_PORT"] = "80000"
+    os.environ["MASTER_PORT"] = "8000"
 
     hps = utils.get_hparams()
     mp.spawn(
@@ -72,7 +68,7 @@ def run(rank, n_gpus, hps):
     collate_fn = TextAudioCollate()
     train_loader = DataLoader(
         train_dataset,
-        num_workers=8,
+        num_workers=NUM_DATA_WORKERS,
         shuffle=False,
         pin_memory=True,
         collate_fn=collate_fn,
@@ -82,7 +78,7 @@ def run(rank, n_gpus, hps):
         eval_dataset = TextAudioLoader(hps.data.validation_files, hps.data)
         eval_loader = DataLoader(
             eval_dataset,
-            num_workers=8,
+            num_workers=NUM_DATA_WORKERS,
             shuffle=False,
             batch_size=hps.train.batch_size,
             pin_memory=True,
