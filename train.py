@@ -19,7 +19,7 @@ from text.symbols import symbols
 
 torch.backends.cudnn.benchmark = True
 global_step = 0
-NUM_DATA_WORKERS = 2
+NUM_DATA_WORKERS = 1
 
 
 def main():
@@ -259,13 +259,22 @@ def train_and_evaluate(
         if rank == 0:
             if global_step % hps.train.log_interval == 0:
                 lr = optim_g.param_groups[0]["lr"]
-                losses = [loss_disc, loss_gen, loss_fm, loss_mel, loss_dur, loss_kl]
                 logger.info(
-                    "Train Epoch: {} [{:.0f}%]".format(
-                        epoch, 100.0 * batch_idx / len(train_loader)
-                    )
+                    "Train Epoch: %d [%.0f%%]",
+                    epoch,
+                    100 * batch_idx / len(train_loader),
                 )
-                logger.info([x.item() for x in losses] + [global_step, lr])
+                logger.info(
+                    "step %09d  dis_loss %6.3f  gen_loss %6.3f  fm_loss %6.3f  mel_loss %6.3f  dur_loss %6.3f  kl_loss %6.3f  lr %.3e",
+                    global_step,
+                    loss_disc,
+                    loss_gen,
+                    loss_fm,
+                    loss_mel,
+                    loss_dur,
+                    loss_kl,
+                    lr,
+                )
 
                 scalar_dict = {
                     "loss/g/total": loss_gen_all,
@@ -341,6 +350,7 @@ def evaluate(hps, generator, eval_loader, writer_eval):
         for batch_idx, (x, x_lengths, spec, spec_lengths, y, y_lengths) in enumerate(
             eval_loader
         ):
+            del batch_idx
             x, x_lengths = x.cuda(0), x_lengths.cuda(0)
             spec, spec_lengths = spec.cuda(0), spec_lengths.cuda(0)
             y, y_lengths = y.cuda(0), y_lengths.cuda(0)
@@ -354,6 +364,7 @@ def evaluate(hps, generator, eval_loader, writer_eval):
             y_lengths = y_lengths[:1]
             break
         y_hat, attn, mask, *_ = generator.module.infer(x, x_lengths, max_len=1000)
+        del attn
         y_hat_lengths = mask.sum([1, 2]).long() * hps.data.hop_length
 
         mel = spec_to_mel_torch(
