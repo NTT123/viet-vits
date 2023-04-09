@@ -20,7 +20,7 @@ from text.symbols import symbols
 torch.backends.cudnn.benchmark = True
 global_step = 0
 NUM_DATA_WORKERS = 1
-
+NUM_GRAD_ACCUM_STEPS = 4
 
 def main():
     """Assume Single Node Multi GPUs Training Only"""
@@ -137,7 +137,6 @@ def run(rank, n_gpus, hps):
                 hps,
                 [net_g, net_d],
                 [optim_g, optim_d],
-                [scheduler_g, scheduler_d],
                 scaler,
                 [train_loader, eval_loader],
                 logger,
@@ -150,7 +149,6 @@ def run(rank, n_gpus, hps):
                 hps,
                 [net_g, net_d],
                 [optim_g, optim_d],
-                [scheduler_g, scheduler_d],
                 scaler,
                 [train_loader, None],
                 None,
@@ -161,11 +159,10 @@ def run(rank, n_gpus, hps):
 
 
 def train_and_evaluate(
-    rank, epoch, hps, nets, optims, schedulers, scaler, loaders, logger, writers
+    rank, epoch, hps, nets, optims, scaler, loaders, logger, writers
 ):
     net_g, net_d = nets
     optim_g, optim_d = optims
-    scheduler_g, scheduler_d = schedulers
     train_loader, eval_loader = loaders
     if writers is not None:
         writer, writer_eval = writers
@@ -175,9 +172,40 @@ def train_and_evaluate(
 
     net_g.train()
     net_d.train()
-    for batch_idx, (x, x_lengths, spec, spec_lengths, y, y_lengths) in enumerate(
-        train_loader
-    ):
+
+    def disc_gradient_step(batch):
+        (x, x_lengths, spec, spec_lengths, y, y_lengths) = batch
+        x, x_lengths = x.cuda(rank, non_blocking=True), x_lengths.cuda(
+            rank, non_blocking=True
+        )
+        spec, spec_lengths = spec.cuda(rank, non_blocking=True), spec_lengths.cuda(
+            rank, non_blocking=True
+        )
+        y, y_lengths = y.cuda(rank, non_blocking=True), y_lengths.cuda(
+            rank, non_blocking=True
+        )
+
+        with autocast(enabled=hps.train.fp16_run):
+            with torch.no_grad():
+                (y_hat, _, _, ids_slice, _, _, _) = net_g(
+                    x, x_lengths, spec, spec_lengths
+                )
+            y = commons.slice_segments(
+                y, ids_slice * hps.data.hop_length, hps.train.segment_size
+            )  # slice
+
+            # Discriminator
+            y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
+            with autocast(enabled=False):
+                loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
+                    y_d_hat_r, y_d_hat_g
+                )
+                loss_disc_all = loss_disc
+        scaler.scale(loss_disc_all).backward()
+        return loss_disc, loss_disc_all, losses_disc_r, losses_disc_g
+
+    def gen_gradient_step(batch):
+        (x, x_lengths, spec, spec_lengths, y, y_lengths) = batch
         x, x_lengths = x.cuda(rank, non_blocking=True), x_lengths.cuda(
             rank, non_blocking=True
         )
@@ -194,9 +222,9 @@ def train_and_evaluate(
                 l_length,
                 attn,
                 ids_slice,
-                x_mask,
+                _,
                 z_mask,
-                (z, z_p, m_p, logs_p, m_q, logs_q),
+                (z, z_p, m_p, logs_p, _, logs_q),
             ) = net_g(x, x_lengths, spec, spec_lengths)
 
             mel = spec_to_mel_torch(
@@ -225,22 +253,9 @@ def train_and_evaluate(
                 y, ids_slice * hps.data.hop_length, hps.train.segment_size
             )  # slice
 
-            # Discriminator
-            y_d_hat_r, y_d_hat_g, _, _ = net_d(y, y_hat.detach())
-            with autocast(enabled=False):
-                loss_disc, losses_disc_r, losses_disc_g = discriminator_loss(
-                    y_d_hat_r, y_d_hat_g
-                )
-                loss_disc_all = loss_disc
-        optim_d.zero_grad()
-        scaler.scale(loss_disc_all).backward()
-        scaler.unscale_(optim_d)
-        grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
-        scaler.step(optim_d)
-
         with autocast(enabled=hps.train.fp16_run):
             # Generator
-            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
+            _, y_d_hat_g, fmap_r, fmap_g = net_d(y, y_hat)
             with autocast(enabled=False):
                 loss_dur = torch.sum(l_length.float())
                 loss_mel = F.l1_loss(y_mel, y_hat_mel) * hps.train.c_mel
@@ -249,12 +264,58 @@ def train_and_evaluate(
                 loss_fm = feature_loss(fmap_r, fmap_g)
                 loss_gen, losses_gen = generator_loss(y_d_hat_g)
                 loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
-        optim_g.zero_grad()
         scaler.scale(loss_gen_all).backward()
-        scaler.unscale_(optim_g)
-        grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
-        scaler.step(optim_g)
-        scaler.update()
+        return (
+            loss_gen,
+            loss_fm,
+            loss_mel,
+            loss_dur,
+            loss_kl,
+            loss_gen_all,
+            losses_gen,
+            y_mel,
+            y_hat_mel,
+            mel,
+            attn,
+        )
+
+    batchs = []
+    for batch_idx, batch in enumerate(train_loader):
+        batchs.append(batch)
+        if len(batchs) == NUM_GRAD_ACCUM_STEPS:
+            optim_d.zero_grad()
+            for batch in batchs:
+                (
+                    loss_disc,
+                    loss_disc_all,
+                    losses_disc_r,
+                    losses_disc_g,
+                ) = disc_gradient_step(batch)
+
+            scaler.unscale_(optim_d)
+            grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+            scaler.step(optim_d)
+
+            optim_g.zero_grad()
+            for batch in batchs:
+                (
+                    loss_gen,
+                    loss_fm,
+                    loss_mel,
+                    loss_dur,
+                    loss_kl,
+                    loss_gen_all,
+                    losses_gen,
+                    y_mel,
+                    y_hat_mel,
+                    mel,
+                    attn,
+                ) = gen_gradient_step(batch)
+            scaler.unscale_(optim_g)
+            grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+            scaler.step(optim_g)
+            scaler.update()
+            batchs = []
 
         if rank == 0:
             if global_step % hps.train.log_interval == 0:
