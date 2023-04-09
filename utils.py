@@ -19,6 +19,7 @@ logger = logging
 def load_checkpoint(checkpoint_path, model, optimizer=None):
     assert os.path.isfile(checkpoint_path)
     checkpoint_dict = torch.load(checkpoint_path, map_location="cpu")
+    epoch = checkpoint_dict["epoch"]
     iteration = checkpoint_dict["iteration"]
     learning_rate = checkpoint_dict["learning_rate"]
     if optimizer is not None:
@@ -42,10 +43,10 @@ def load_checkpoint(checkpoint_path, model, optimizer=None):
     logger.info(
         "Loaded checkpoint '{}' (iteration {})".format(checkpoint_path, iteration)
     )
-    return model, optimizer, learning_rate, iteration
+    return model, optimizer, learning_rate, epoch, iteration
 
 
-def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path):
+def save_checkpoint(model, optimizer, learning_rate, epoch, iteration, checkpoint_path):
     logger.info(
         "Saving model and optimizer state at iteration {} to {}".format(
             iteration, checkpoint_path
@@ -58,6 +59,7 @@ def save_checkpoint(model, optimizer, learning_rate, iteration, checkpoint_path)
     torch.save(
         {
             "model": state_dict,
+            "epoch": epoch,
             "iteration": iteration,
             "optimizer": optimizer.state_dict(),
             "learning_rate": learning_rate,
