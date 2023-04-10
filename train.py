@@ -8,6 +8,7 @@ from torch.nn import functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from tqdm.cli import tqdm
 
 import commons
 import utils
@@ -20,7 +21,6 @@ from text.symbols import symbols
 torch.backends.cudnn.benchmark = True
 global_step = 0
 NUM_DATA_WORKERS = 1
-NUM_GRAD_ACCUM_STEPS = 4
 
 
 def main():
@@ -32,14 +32,7 @@ def main():
     os.environ["MASTER_PORT"] = "8000"
 
     hps = utils.get_hparams()
-    mp.spawn(
-        run,
-        nprocs=n_gpus,
-        args=(
-            n_gpus,
-            hps,
-        ),
-    )
+    run(0, 1, hps)
 
 
 def run(rank, n_gpus, hps):
@@ -51,9 +44,6 @@ def run(rank, n_gpus, hps):
         writer = SummaryWriter(log_dir=hps.model_dir)
         writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
 
-    dist.init_process_group(
-        backend="nccl", init_method="env://", world_size=n_gpus, rank=rank
-    )
     torch.manual_seed(hps.train.seed)
     torch.cuda.set_device(rank)
 
@@ -61,7 +51,7 @@ def run(rank, n_gpus, hps):
     train_sampler = DistributedBucketSampler(
         train_dataset,
         hps.train.batch_size,
-        [32, 300, 400, 500, 600, 700, 800, 900, 1000],
+        [32, 200, 300, 400, 500, 600, 700, 800, 900, 1000],
         num_replicas=n_gpus,
         rank=rank,
         shuffle=True,
@@ -106,8 +96,6 @@ def run(rank, n_gpus, hps):
         betas=hps.train.betas,
         eps=hps.train.eps,
     )
-    net_g = DDP(net_g, device_ids=[rank])
-    net_d = DDP(net_d, device_ids=[rank])
 
     try:
         _, _, _, last_epoch, last_iteration = utils.load_checkpoint(
@@ -259,8 +247,7 @@ def train_and_evaluate(
             attn,
         )
 
-    batchs = []
-    for batch_idx, batch in enumerate(train_loader):
+    for batch_idx, batch in enumerate(tqdm(train_loader)):
         (x, x_lengths, spec, spec_lengths, y, y_lengths) = batch
         x, x_lengths = x.cuda(rank, non_blocking=True), x_lengths.cuda(
             rank, non_blocking=True
@@ -272,133 +259,138 @@ def train_and_evaluate(
             rank, non_blocking=True
         )
         batch = (x, x_lengths, spec, spec_lengths, y, y_lengths)
-        batchs.append(batch)
-        if len(batchs) >= NUM_GRAD_ACCUM_STEPS:
-            optim_d.zero_grad()
-            for batch in batchs:
-                (
+        seq_len = spec.shape[-1]
+        if seq_len <= 200:
+            num_part = 1 * 4
+        elif seq_len <= 800:
+            num_part = 2 * 4
+        else:
+            num_part = 4 * 4
+        part_size = spec.shape[0] // num_part
+        batchs = []
+        for start_idx in range(0, y.shape[0], part_size):
+            end_idx = start_idx + part_size
+            batchs.append([t[start_idx:end_idx] for t in batch])
+
+        optim_d.zero_grad()
+        for batch in batchs:
+            (
+                loss_disc,
+                loss_disc_all,
+                losses_disc_r,
+                losses_disc_g,
+            ) = disc_gradient_step(batch)
+
+        scaler.unscale_(optim_d)
+        grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
+        scaler.step(optim_d)
+
+        optim_g.zero_grad()
+        for batch in batchs:
+            (
+                loss_gen,
+                loss_fm,
+                loss_mel,
+                loss_dur,
+                loss_kl,
+                loss_gen_all,
+                losses_gen,
+                y_mel,
+                y_hat_mel,
+                mel,
+                attn,
+            ) = gen_gradient_step(batch)
+        scaler.unscale_(optim_g)
+        grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
+        scaler.step(optim_g)
+        scaler.update()
+        batchs = []
+
+        if rank == 0:
+            if global_step % hps.train.log_interval == 0:
+                lr = optim_g.param_groups[0]["lr"]
+                logger.info(
+                    "Train Epoch: %d [%.0f%%]",
+                    epoch,
+                    100 * batch_idx / len(train_loader),
+                )
+                logger.info(
+                    "step %09d  dis_loss %6.3f  gen_loss %6.3f  fm_loss %6.3f  mel_loss %6.3f  dur_loss %6.3f  kl_loss %6.3f  lr %.3e",
+                    global_step,
                     loss_disc,
-                    loss_disc_all,
-                    losses_disc_r,
-                    losses_disc_g,
-                ) = disc_gradient_step(batch)
-
-            scaler.unscale_(optim_d)
-            grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
-            scaler.step(optim_d)
-
-            optim_g.zero_grad()
-            for batch in batchs:
-                (
                     loss_gen,
                     loss_fm,
                     loss_mel,
                     loss_dur,
                     loss_kl,
-                    loss_gen_all,
-                    losses_gen,
-                    y_mel,
-                    y_hat_mel,
-                    mel,
-                    attn,
-                ) = gen_gradient_step(batch)
-            scaler.unscale_(optim_g)
-            grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
-            scaler.step(optim_g)
-            scaler.update()
-            batchs = []
+                    lr,
+                )
 
-            if rank == 0:
-                if global_step % hps.train.log_interval == 0:
-                    lr = optim_g.param_groups[0]["lr"]
-                    logger.info(
-                        "Train Epoch: %d [%.0f%%]",
-                        epoch,
-                        100 * batch_idx / len(train_loader),
-                    )
-                    logger.info(
-                        "step %09d  dis_loss %6.3f  gen_loss %6.3f  fm_loss %6.3f  mel_loss %6.3f  dur_loss %6.3f  kl_loss %6.3f  lr %.3e",
-                        global_step,
-                        loss_disc,
-                        loss_gen,
-                        loss_fm,
-                        loss_mel,
-                        loss_dur,
-                        loss_kl,
-                        lr,
-                    )
-
-                    scalar_dict = {
-                        "loss/g/total": loss_gen_all,
-                        "loss/d/total": loss_disc_all,
-                        "learning_rate": lr,
-                        "grad_norm_d": grad_norm_d,
-                        "grad_norm_g": grad_norm_g,
+                scalar_dict = {
+                    "loss/g/total": loss_gen_all,
+                    "loss/d/total": loss_disc_all,
+                    "learning_rate": lr,
+                    "grad_norm_d": grad_norm_d,
+                    "grad_norm_g": grad_norm_g,
+                }
+                scalar_dict.update(
+                    {
+                        "loss/g/fm": loss_fm,
+                        "loss/g/mel": loss_mel,
+                        "loss/g/dur": loss_dur,
+                        "loss/g/kl": loss_kl,
                     }
-                    scalar_dict.update(
-                        {
-                            "loss/g/fm": loss_fm,
-                            "loss/g/mel": loss_mel,
-                            "loss/g/dur": loss_dur,
-                            "loss/g/kl": loss_kl,
-                        }
-                    )
+                )
 
-                    scalar_dict.update(
-                        {"loss/g/{}".format(i): v for i, v in enumerate(losses_gen)}
-                    )
-                    scalar_dict.update(
-                        {
-                            "loss/d_r/{}".format(i): v
-                            for i, v in enumerate(losses_disc_r)
-                        }
-                    )
-                    scalar_dict.update(
-                        {
-                            "loss/d_g/{}".format(i): v
-                            for i, v in enumerate(losses_disc_g)
-                        }
-                    )
-                    image_dict = {
-                        "slice/mel_org": utils.plot_spectrogram_to_numpy(
-                            y_mel[0].data.cpu().numpy()
-                        ),
-                        "slice/mel_gen": utils.plot_spectrogram_to_numpy(
-                            y_hat_mel[0].data.cpu().numpy()
-                        ),
-                        "all/mel": utils.plot_spectrogram_to_numpy(
-                            mel[0].data.cpu().numpy()
-                        ),
-                        "all/attn": utils.plot_alignment_to_numpy(
-                            attn[0, 0].data.cpu().numpy()
-                        ),
-                    }
-                    utils.summarize(
-                        writer=writer,
-                        global_step=global_step,
-                        images=image_dict,
-                        scalars=scalar_dict,
-                    )
+                scalar_dict.update(
+                    {"loss/g/{}".format(i): v for i, v in enumerate(losses_gen)}
+                )
+                scalar_dict.update(
+                    {"loss/d_r/{}".format(i): v for i, v in enumerate(losses_disc_r)}
+                )
+                scalar_dict.update(
+                    {"loss/d_g/{}".format(i): v for i, v in enumerate(losses_disc_g)}
+                )
+                image_dict = {
+                    "slice/mel_org": utils.plot_spectrogram_to_numpy(
+                        y_mel[0].data.cpu().numpy()
+                    ),
+                    "slice/mel_gen": utils.plot_spectrogram_to_numpy(
+                        y_hat_mel[0].data.cpu().numpy()
+                    ),
+                    "all/mel": utils.plot_spectrogram_to_numpy(
+                        mel[0].data.cpu().numpy()
+                    ),
+                    "all/attn": utils.plot_alignment_to_numpy(
+                        attn[0, 0].data.cpu().numpy()
+                    ),
+                }
+                utils.summarize(
+                    writer=writer,
+                    global_step=global_step,
+                    images=image_dict,
+                    scalars=scalar_dict,
+                )
 
-                if global_step % hps.train.eval_interval == 0:
-                    evaluate(hps, net_g, eval_loader, writer_eval)
-                    utils.save_checkpoint(
-                        net_g,
-                        optim_g,
-                        hps.train.learning_rate,
-                        epoch,
-                        global_step,
-                        os.path.join(hps.model_dir, "G_{}.pth".format(global_step)),
-                    )
-                    utils.save_checkpoint(
-                        net_d,
-                        optim_d,
-                        hps.train.learning_rate,
-                        epoch,
-                        global_step,
-                        os.path.join(hps.model_dir, "D_{}.pth".format(global_step)),
-                    )
-            global_step += 1
+            if global_step % hps.train.eval_interval == 0:
+                evaluate(hps, net_g, eval_loader, writer_eval)
+                utils.save_checkpoint(
+                    net_g,
+                    optim_g,
+                    hps.train.learning_rate,
+                    epoch,
+                    global_step,
+                    os.path.join(hps.model_dir, "G_{}.pth".format(global_step)),
+                )
+                utils.save_checkpoint(
+                    net_d,
+                    optim_d,
+                    hps.train.learning_rate,
+                    epoch,
+                    global_step,
+                    os.path.join(hps.model_dir, "D_{}.pth".format(global_step)),
+                )
+        global_step += 1
 
     if rank == 0:
         logger.info("====> Epoch: {}".format(epoch))
@@ -423,7 +415,7 @@ def evaluate(hps, generator, eval_loader, writer_eval):
             y = y[:1]
             y_lengths = y_lengths[:1]
             break
-        y_hat, attn, mask, *_ = generator.module.infer(x, x_lengths, max_len=1000)
+        y_hat, attn, mask, *_ = generator.infer(x, x_lengths, max_len=1000)
         del attn
         y_hat_lengths = mask.sum([1, 2]).long() * hps.data.hop_length
 
