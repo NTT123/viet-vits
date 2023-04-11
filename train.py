@@ -161,7 +161,7 @@ def train_and_evaluate(
     net_g.train()
     net_d.train()
 
-    def disc_gradient_step(batch):
+    def disc_gradient_step(batch, scale_factor):
         (x, x_lengths, spec, spec_lengths, y, y_lengths) = batch
         with autocast(enabled=hps.train.fp16_run):
             with torch.no_grad():
@@ -179,10 +179,10 @@ def train_and_evaluate(
                     y_d_hat_r, y_d_hat_g
                 )
                 loss_disc_all = loss_disc
-        scaler.scale(loss_disc_all).backward()
+        scaler.scale(loss_disc_all / scale_factor).backward()
         return loss_disc, loss_disc_all, losses_disc_r, losses_disc_g
 
-    def gen_gradient_step(batch):
+    def gen_gradient_step(batch, scale_factor):
         (x, x_lengths, spec, spec_lengths, y, y_lengths) = batch
         with autocast(enabled=hps.train.fp16_run):
             (
@@ -232,7 +232,7 @@ def train_and_evaluate(
                 loss_fm = feature_loss(fmap_r, fmap_g)
                 loss_gen, losses_gen = generator_loss(y_d_hat_g)
                 loss_gen_all = loss_gen + loss_fm + loss_mel + loss_dur + loss_kl
-        scaler.scale(loss_gen_all).backward()
+        scaler.scale(loss_gen_all / scale_factor).backward()
         return (
             loss_gen,
             loss_fm,
@@ -279,7 +279,7 @@ def train_and_evaluate(
                 loss_disc_all,
                 losses_disc_r,
                 losses_disc_g,
-            ) = disc_gradient_step(batch)
+            ) = disc_gradient_step(batch, num_part)
 
         scaler.unscale_(optim_d)
         grad_norm_d = commons.clip_grad_value_(net_d.parameters(), None)
@@ -299,7 +299,7 @@ def train_and_evaluate(
                 y_hat_mel,
                 mel,
                 attn,
-            ) = gen_gradient_step(batch)
+            ) = gen_gradient_step(batch, num_part)
         scaler.unscale_(optim_g)
         grad_norm_g = commons.clip_grad_value_(net_g.parameters(), None)
         scaler.step(optim_g)
