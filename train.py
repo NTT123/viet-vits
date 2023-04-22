@@ -261,11 +261,11 @@ def train_and_evaluate(
         batch = (x, x_lengths, spec, spec_lengths, y, y_lengths)
         seq_len = spec.shape[-1]
         if seq_len <= 200:
-            num_part = 1 * 4
+            num_part = 1 * 3
         elif seq_len <= 800:
-            num_part = 2 * 4
+            num_part = 2 * 3
         else:
-            num_part = 4 * 4
+            num_part = 4 * 3
         part_size = spec.shape[0] // num_part
         batchs = []
         for start_idx in range(0, y.shape[0], part_size):
