@@ -19,8 +19,10 @@ from models import MultiPeriodDiscriminator, SynthesizerTrn
 from text.symbols import symbols
 
 torch.backends.cudnn.benchmark = True
-global_step = 0
 NUM_DATA_WORKERS = 1
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+global_step = 0
 
 
 def main():
@@ -260,12 +262,14 @@ def train_and_evaluate(
         )
         batch = (x, x_lengths, spec, spec_lengths, y, y_lengths)
         seq_len = spec.shape[-1]
-        if seq_len <= 200:
-            num_part = 1 * 3
-        elif seq_len <= 800:
-            num_part = 2 * 3
+        if seq_len <= 150:
+            num_part = 1
+        elif seq_len <= 400:
+            num_part = 2
+        elif seq_len <= 600:
+            num_part = 3
         else:
-            num_part = 4 * 3
+            num_part = 4
         part_size = spec.shape[0] // num_part
         batchs = []
         for start_idx in range(0, y.shape[0], part_size):
